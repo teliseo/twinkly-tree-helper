@@ -1,51 +1,51 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v1)
+"""Twinkly Tree Helper (v2)
 
-Goal
-----
-A tiny Linux-friendly CLI to help you *physically* find specific LEDs (especially
-string ends) by lighting individual lamps or running simple chase patterns.
+Objective
+---------
+A small Linux-friendly CLI to help you *physically* locate LEDs (especially the
+end of each physical string) by lighting specific lamps or running simple chase
+patterns, using Twinkly's local LAN API.
 
-This talks directly to the Twinkly local LAN HTTP API (xled v1).
+v2 changes
+----------
+- Keep a *single* filename (this file) and track the revision in-code.
+- `discover` can write a current-directory parameter file that defines named
+  *strings* (segments) derived from each device's `device_name`.
+- Other commands can target a string via `--string NAME` instead of `--ip`.
 
-What it can do (v1)
--------------------
-- Discover devices on your LAN via UDP broadcast (port 5555)
-- Login/verify to obtain an auth token
-- Set mode to `rt` and push single-frame data to /xled/v1/led/rt/frame
-- Light a single LED index (optionally blink)
-- Chase a single lit LED across a range
-- "Find end" helper that blinks the last LED (or last N LEDs)
+String naming and segmentation
+------------------------------
+`discover --write-params` creates one or more *string* entries per Twinkly device.
+Each string name is:
+
+    <device_name><suffix>
+
+where suffix is 'a', 'b', 'c', ... for each segment.
+
+Segmentation heuristic (no extra user input required):
+- If the device LED count is divisible by 300, it is split into 300-LED segments.
+  (e.g., 600 -> two strings: 'a' and 'b')
+- Otherwise, it is treated as a single string (suffix 'a')
+
+Parameter file format
+---------------------
+JSON file in the current working directory.
+Default name: ./twinkly_strings.json
+
+Example entry:
+  {
+    "MyTreea": {"ip":"192.168.1.10","start":0,"length":300,"device_name":"MyTree",...},
+    "MyTreeb": {"ip":"192.168.1.10","start":300,"length":300,"device_name":"MyTree",...}
+  }
 
 Notes / assumptions
 -------------------
-- Uses the REST endpoint /xled/v1/led/rt/frame (HTTP). Docs mention a UDP realtime
-  protocol too; HTTP is simpler and works for the "mapping" use case.
-- Color bytes are sent as R,G,B for 3-bytes-per-led devices.
-  For 4-bytes-per-led devices (RGBW), this script sends R,G,B,0.
-- LED index 0 is the LED closest to the controller/driver; last LED is the far end.
-
-References
-----------
-- xled-docs REST API: /xled/v1/login, /xled/v1/verify, /xled/v1/led/mode, /xled/v1/led/rt/frame
-- xled-docs protocol details: discovery UDP broadcast to port 5555 and RGB byte order
-
-Usage examples
---------------
-# 1) Discover Twinkly devices
-./twinkly_tree_helper_v1.py discover
-
-# 2) Print info, including LED count
-./twinkly_tree_helper_v1.py info --ip 192.168.1.123
-
-# 3) Blink the very last LED (good for finding the end)
-./twinkly_tree_helper_v1.py find-end --ip 192.168.1.123
-
-# 4) Chase the last 50 LEDs backward to the controller (helps trace a strand)
-./twinkly_tree_helper_v1.py chase --ip 192.168.1.123 --start -1 --end -50 --delay 0.08
-
-# 5) Light a specific LED index (0-based)
-./twinkly_tree_helper_v1.py light --ip 192.168.1.123 --led 299 --rgb 255,0,0
+- Uses Twinkly's local HTTP API under /xled/v1.
+- Uses realtime HTTP frames (/xled/v1/led/rt/frame) because it's simple and fits
+  the "find the LED" use-case.
+- LED indexing is 0-based within the addressed device; for `--string`, indexes are
+  0-based within the segment (and negative indexes work like Python).
 
 """
 
@@ -55,7 +55,6 @@ import argparse
 import base64
 import json
 import os
-import random
 import socket
 import sys
 import time
@@ -63,12 +62,17 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
+VERSION = 2
 DEFAULT_TIMEOUT_S = 3.0
+
 DISCOVERY_PORT = 5555
-DISCOVERY_PAYLOAD = b"\x01discover"
+DISCOVERY_PAYLOAD = b"discover"
+
+DEFAULT_PARAMS_FILENAME = "twinkly_strings.json"
+DEFAULT_SEGMENT_LEN = 300
 
 
 def _http_json(
@@ -121,13 +125,12 @@ def _http_octet_stream(
         raise RuntimeError(f"HTTP {e.code} for POST {url}: {raw}") from e
 
 
-def discover(timeout_s: float = 0.8) -> List[str]:
+def discover(timeout_s: float = 0.9) -> List[str]:
     """Return a list of IPs of Twinkly devices discovered on the local network."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.settimeout(timeout_s)
 
-    # Send broadcast on all interfaces (best-effort)
     sock.sendto(DISCOVERY_PAYLOAD, ("255.255.255.255", DISCOVERY_PORT))
 
     ips: List[str] = []
@@ -137,7 +140,7 @@ def discover(timeout_s: float = 0.8) -> List[str]:
             data, _addr = sock.recvfrom(1024)
         except socket.timeout:
             break
-        # First 4 bytes are reversed IP octets per docs; we can also trust sender address.
+        # First 4 bytes are reversed IP octets per docs.
         if len(data) >= 6 and data[4:6] == b"OK":
             ip = ".".join(str(b) for b in data[3::-1])
             if ip not in ips:
@@ -160,7 +163,6 @@ def _cache_dir() -> Path:
 class TokenInfo:
     token_b64: str
     expires_at_unix: float
-    # stored for debugging / future expansion
     ip: str
 
 
@@ -231,12 +233,10 @@ class TwinklyClient:
         )
 
     def login(self) -> None:
-        # If we have a cached token that likely isn't expired, try it first.
         cached = self._load_cached_token()
         if cached and cached.expires_at_unix > time.time() + 30:
             self._token = cached
             try:
-                # Some firmwares accept token without re-verify; others require verify.
                 _http_json(
                     f"{self.base}/led/mode",
                     "GET",
@@ -259,7 +259,6 @@ class TwinklyClient:
         expires_in = float(login_resp.get("authentication_token_expires_in", 14400))
         chall_resp = login_resp.get("challenge-response")
 
-        # Verify step (required before most authenticated endpoints)
         _http_json(
             f"{self.base}/verify",
             "POST",
@@ -292,7 +291,7 @@ def _parse_rgb(s: str) -> Tuple[int, int, int]:
 
 
 def _resolve_index(idx: int, nleds: int) -> int:
-    # Allow negative indices like Python lists: -1 means last LED
+    # Allow negative indices like Python lists: -1 means last
     if idx < 0:
         idx = nleds + idx
     if idx < 0 or idx >= nleds:
@@ -308,7 +307,6 @@ def build_frame_single(
 ) -> bytes:
     """Build a single-frame payload with only selected indices lit."""
     if bytes_per_led not in (3, 4):
-        # best-effort; many devices are 3 (RGB) or 4 (RGBW)
         raise ValueError(f"Unsupported bytes_per_led={bytes_per_led}; expected 3 or 4")
 
     r, g, b = rgb
@@ -322,47 +320,161 @@ def build_frame_single(
             out[base + 1] = g
             out[base + 2] = b
             if bytes_per_led == 4:
-                out[base + 3] = 0  # white channel off by default
+                out[base + 3] = 0  # white channel off
 
     return bytes(out)
 
 
-def cmd_discover(_args: argparse.Namespace) -> int:
-    ips = discover(timeout_s=0.9)
+def _params_path(path_arg: Optional[str]) -> Path:
+    if path_arg:
+        return Path(path_arg)
+    return Path.cwd() / DEFAULT_PARAMS_FILENAME
+
+
+def _load_params(path: Path) -> Dict[str, dict]:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Params file not found: {path}. Run: discover --write-params"
+        ) from e
+
+
+def _save_params(path: Path, data: Dict[str, dict]) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "
+", "utf-8")
+
+
+def _suffix_letters(n: int) -> List[str]:
+    # 'a'..'z', then 'aa'.. (basic spreadsheet-style)
+    out: List[str] = []
+    i = 0
+    while len(out) < n:
+        x = i
+        s = ""
+        while True:
+            s = chr(ord("a") + (x % 26)) + s
+            x = x // 26 - 1
+            if x < 0:
+                break
+        out.append(s)
+        i += 1
+    return out
+
+
+def _segment_count(nleds: int, segment_len: int) -> int:
+    if segment_len <= 0:
+        return 1
+    if nleds % segment_len == 0:
+        return max(1, nleds // segment_len)
+    return 1
+
+
+def _string_target_from_args(args: argparse.Namespace) -> Tuple[str, int, int]:
+    """Return (ip, start_offset, length) based on either --ip or --string."""
+    if getattr(args, "ip", None):
+        return (args.ip, 0, -1)
+
+    name = getattr(args, "string", None)
+    if not name:
+        raise RuntimeError("Internal error: neither --ip nor --string provided")
+
+    params = _load_params(_params_path(getattr(args, "params", None)))
+    if name not in params:
+        known = ", ".join(sorted(params.keys()))
+        raise RuntimeError(f"Unknown string '{name}'. Known: {known}")
+
+    ent = params[name]
+    return (str(ent["ip"]), int(ent["start"]), int(ent["length"]))
+
+
+def _add_target_args(ap: argparse.ArgumentParser) -> None:
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ip", help="Device IP")
+    g.add_argument("--string", help="Named string from params file (see discover --write-params)")
+    ap.add_argument(
+        "--params",
+        help=f"Params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
+        default=None,
+    )
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    ips = discover(timeout_s=float(args.discovery_timeout))
     if not ips:
         print("No Twinkly devices found via UDP broadcast.")
         return 1
 
+    params_out: Dict[str, dict] = {}
+
     for ip in ips:
         try:
-            c = TwinklyClient(ip)
+            c = TwinklyClient(ip, timeout_s=args.timeout)
             g = c.gestalt()
-            name = g.get("device_name") or g.get("deviceName") or "(unknown)"
-            n = g.get("number_of_led")
-            prof = g.get("led_profile")
-            bpl = g.get("bytes_per_led")
-            print(f"{ip}\t{name}\tleds={n}\tprofile={prof}\tbytes_per_led={bpl}")
+            device_name = g.get("device_name") or g.get("deviceName") or "(unknown)"
+            nleds = int(g.get("number_of_led"))
+            bpl = int(g.get("bytes_per_led", 3))
+
+            print(f"{ip}	{device_name}	leds={nleds}	bytes_per_led={bpl}")
+
+            if args.write_params:
+                seg_len = int(args.segment_len)
+                segs = _segment_count(nleds, seg_len)
+                suffixes = _suffix_letters(segs)
+
+                for si, suf in enumerate(suffixes):
+                    start = si * seg_len if segs > 1 else 0
+                    length = seg_len if segs > 1 else nleds
+                    key = f"{device_name}{suf}"
+                    if key in params_out:
+                        # If duplicate device_name on LAN, disambiguate by IP.
+                        key = f"{device_name}{suf}_{ip}"
+
+                    params_out[key] = {
+                        "ip": ip,
+                        "device_name": device_name,
+                        "start": start,
+                        "length": length,
+                        "number_of_led": nleds,
+                        "bytes_per_led": bpl,
+                        "segment_len": seg_len,
+                        "version": VERSION,
+                    }
+
         except Exception as e:
-            print(f"{ip}\t(error reading gestalt: {e})")
+            print(f"{ip}	(error reading gestalt: {e})")
+
+    if args.write_params:
+        path = _params_path(args.params_out)
+        _save_params(path, params_out)
+        print(f"
+Wrote {len(params_out)} string entries to: {path}")
 
     return 0
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    c = TwinklyClient(args.ip, timeout_s=args.timeout)
+    ip, start, length = _string_target_from_args(args)
+
+    c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
-    # auth only when needed
+
     try:
         mode = c.get_mode()
     except Exception:
         mode = "(auth required / unavailable)"
 
-    print(json.dumps({"ip": args.ip, "mode": mode, "gestalt": g}, indent=2))
+    out = {
+        "version": VERSION,
+        "target": {"ip": ip, "start": start, "length": length, "string": getattr(args, "string", None)},
+        "mode": mode,
+        "gestalt": g,
+    }
+    print(json.dumps(out, indent=2))
     return 0
 
 
 def _with_rt_mode(c: TwinklyClient):
-    """Context manager-ish helper: set rt mode and restore previous mode on exit."""
     class _Ctx:
         def __init__(self):
             self.prev: Optional[str] = None
@@ -376,7 +488,6 @@ def _with_rt_mode(c: TwinklyClient):
             return self
 
         def __exit__(self, exc_type, exc, tb):
-            # Best-effort restore.
             if self.prev:
                 try:
                     c.set_mode(self.prev)
@@ -388,12 +499,20 @@ def _with_rt_mode(c: TwinklyClient):
 
 
 def cmd_light(args: argparse.Namespace) -> int:
-    c = TwinklyClient(args.ip, timeout_s=args.timeout)
+    ip, start, seg_len = _string_target_from_args(args)
+
+    c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
     nleds = int(g["number_of_led"])
     bpl = int(g.get("bytes_per_led", 3))
 
-    idx = _resolve_index(args.led, nleds)
+    # Resolve LED index within segment -> device-wide index
+    seg_n = seg_len if seg_len > 0 else nleds
+    rel = _resolve_index(int(args.led), seg_n)
+    idx = start + rel
+    if idx < 0 or idx >= nleds:
+        raise ValueError(f"Resolved LED index out of device range: {idx} (nleds={nleds})")
+
     rgb = args.rgb
 
     with _with_rt_mode(c):
@@ -413,13 +532,19 @@ def cmd_light(args: argparse.Namespace) -> int:
 
 
 def cmd_find_end(args: argparse.Namespace) -> int:
-    c = TwinklyClient(args.ip, timeout_s=args.timeout)
+    ip, start, seg_len = _string_target_from_args(args)
+
+    c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
     nleds = int(g["number_of_led"])
     bpl = int(g.get("bytes_per_led", 3))
 
+    seg_n = seg_len if seg_len > 0 else nleds
+
     count = max(1, int(args.last_n))
-    idxs = list(range(nleds - count, nleds))
+    # last N within the segment
+    rel_idxs = list(range(seg_n - count, seg_n))
+    idxs = [start + r for r in rel_idxs]
 
     with _with_rt_mode(c):
         period = 1.0 / float(args.blink_hz)
@@ -433,63 +558,84 @@ def cmd_find_end(args: argparse.Namespace) -> int:
 
 
 def cmd_chase(args: argparse.Namespace) -> int:
-    c = TwinklyClient(args.ip, timeout_s=args.timeout)
+    ip, start, seg_len = _string_target_from_args(args)
+
+    c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
     nleds = int(g["number_of_led"])
     bpl = int(g.get("bytes_per_led", 3))
 
-    start = _resolve_index(args.start, nleds) if args.start is not None else 0
-    end = _resolve_index(args.end, nleds) if args.end is not None else (nleds - 1)
+    seg_n = seg_len if seg_len > 0 else nleds
+
+    start_rel = _resolve_index(int(args.start), seg_n)
+    end_rel = _resolve_index(int(args.end), seg_n)
 
     step = int(args.step)
     if step == 0:
         raise ValueError("step cannot be 0")
 
-    # If user gave start > end but positive step, invert automatically
-    if start > end and step > 0:
+    # Auto-adjust direction for user convenience
+    if start_rel > end_rel and step > 0:
         step = -step
-    if start < end and step < 0:
+    if start_rel < end_rel and step < 0:
         step = -step
 
-    path = list(range(start, end + (1 if step > 0 else -1), step))
-    if not path:
+    path_rel = list(range(start_rel, end_rel + (1 if step > 0 else -1), step))
+    if not path_rel:
         return 0
 
     with _with_rt_mode(c):
         for _ in range(max(1, int(args.loops))):
-            for i in path:
-                c.rt_frame(build_frame_single(nleds, bpl, [i], args.rgb))
+            for r in path_rel:
+                idx = start + r
+                c.rt_frame(build_frame_single(nleds, bpl, [idx], args.rgb))
                 time.sleep(float(args.delay))
 
     return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Twinkly Tree Helper (v1)")
-    p.set_defaults(func=None)
-
+    p = argparse.ArgumentParser(description=f"Twinkly Tree Helper (v{VERSION})")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_disc = sub.add_parser("discover", help="Discover Twinkly devices on LAN")
+    p_disc.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="HTTP timeout")
+    p_disc.add_argument("--discovery-timeout", type=float, default=0.9, help="UDP discovery timeout")
+    p_disc.add_argument(
+        "--write-params",
+        action="store_true",
+        help=f"Write named strings to ./{DEFAULT_PARAMS_FILENAME} (or --params-out)",
+    )
+    p_disc.add_argument(
+        "--params-out",
+        default=None,
+        help=f"Output params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
+    )
+    p_disc.add_argument(
+        "--segment-len",
+        type=int,
+        default=DEFAULT_SEGMENT_LEN,
+        help=f"Segment length used when device LED count is divisible by it (default: {DEFAULT_SEGMENT_LEN})",
+    )
     p_disc.set_defaults(func=cmd_discover)
 
     p_info = sub.add_parser("info", help="Print device gestalt + current mode")
-    p_info.add_argument("--ip", required=True, help="Device IP")
+    _add_target_args(p_info)
     p_info.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_info.set_defaults(func=cmd_info)
 
-    p_light = sub.add_parser("light", help="Light a specific LED index (0-based; allow -1 for last)")
-    p_light.add_argument("--ip", required=True)
+    p_light = sub.add_parser("light", help="Light a LED index (0-based within string; allow -1 for last)")
+    _add_target_args(p_light)
     p_light.add_argument("--led", type=int, required=True)
     p_light.add_argument("--rgb", type=_parse_rgb, default=(255, 0, 0))
     p_light.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p_light.add_argument("--hold-s", type=float, default=0.0, help="Hold time after setting (non-blink mode)")
-    p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
+    p_light.add_argument("--hold-s", type=float, default=0.0)
+    p_light.add_argument("--blink-hz", type=float, default=0.0)
     p_light.add_argument("--blink-cycles", type=int, default=10)
     p_light.set_defaults(func=cmd_light)
 
-    p_end = sub.add_parser("find-end", help="Blink the last LED (or last N LEDs)")
-    p_end.add_argument("--ip", required=True)
+    p_end = sub.add_parser("find-end", help="Blink the last LED (or last N) within the target string")
+    _add_target_args(p_end)
     p_end.add_argument("--last-n", type=int, default=1)
     p_end.add_argument("--rgb", type=_parse_rgb, default=(255, 0, 0))
     p_end.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
@@ -497,10 +643,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_end.add_argument("--blink-cycles", type=int, default=20)
     p_end.set_defaults(func=cmd_find_end)
 
-    p_chase = sub.add_parser("chase", help="Chase a single lit LED across a range")
-    p_chase.add_argument("--ip", required=True)
-    p_chase.add_argument("--start", type=int, default=0, help="Start index (allow negative, e.g. -1)")
-    p_chase.add_argument("--end", type=int, default=-1, help="End index (allow negative)")
+    p_chase = sub.add_parser("chase", help="Chase a single lit LED across a range within the target string")
+    _add_target_args(p_chase)
+    p_chase.add_argument("--start", type=int, default=0, help="Start index within string (allow negative)")
+    p_chase.add_argument("--end", type=int, default=-1, help="End index within string (allow negative)")
     p_chase.add_argument("--step", type=int, default=1)
     p_chase.add_argument("--delay", type=float, default=0.05)
     p_chase.add_argument("--loops", type=int, default=1)
