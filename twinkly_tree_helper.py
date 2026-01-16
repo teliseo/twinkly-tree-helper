@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v4)
+"""Twinkly Tree Helper (v5)
 
 Objective
 ---------
@@ -25,6 +25,10 @@ v4 changes
 - RGB parsing supports "R,G,B" as well as "#RRGGBB" (and "#RRGGBBWW").
 - `light` can light a *range* (like `chase`) and supports --rgb2 for interpolation.
 - `chase` supports --rgb2 for interpolation.
+
+v5 changes
+----------
+- Help defaults now display meaningful values (e.g. params file name, and "inf" instead of None).
 
 String naming and segmentation
 ------------------------------
@@ -71,7 +75,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 4
+VERSION = 5
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -440,7 +444,7 @@ def _add_target_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--params",
         help="Params file path",
-        default=None,
+        default=DEFAULT_PARAMS_FILENAME,
     )
 
 
@@ -799,7 +803,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_disc.add_argument(
         "--params-out",
-        default=None,
+        default=DEFAULT_PARAMS_FILENAME,
         help=f"Output params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
     )
     p_disc.add_argument(
@@ -824,7 +828,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="List known string names from params file",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p_strings.add_argument("--params", help="Params file path", default=None)
+    p_strings.add_argument("--params", help="Params file path", default=DEFAULT_PARAMS_FILENAME)
     p_strings.add_argument("--details", action="store_true", help="Show per-string details")
     p_strings.add_argument("--json", action="store_true", help="Emit JSON (full params contents)")
     p_strings.set_defaults(func=cmd_strings)
@@ -846,9 +850,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_light.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
     p_light.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
     p_light.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p_light.add_argument("--hold-s", type=_parse_inf_float, default=None, help="Hold time after setting (use 'inf' to hold forever)")
+    p_light.add_argument("--hold-s", type=_parse_inf_float, default="inf", help="Hold time after setting (use 'inf' to hold forever)")
     p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
-    p_light.add_argument("--blink-cycles", type=_parse_inf_int, default=None, help="Blink cycle count (use 'inf' for infinite)")
+    p_light.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
     p_light.set_defaults(func=cmd_light)
 
     p_end = sub.add_parser(
@@ -861,7 +865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_end.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
     p_end.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_end.add_argument("--blink-hz", type=float, default=2.0)
-    p_end.add_argument("--blink-cycles", type=_parse_inf_int, default=None, help="Blink cycle count (use 'inf' for infinite)")
+    p_end.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
     p_end.set_defaults(func=cmd_find_end)
 
     p_chase = sub.add_parser(
@@ -874,13 +878,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_chase.add_argument("--end", type=int, default=-1, help="End index within string (allow negative)")
     p_chase.add_argument("--step", type=int, default=1)
     p_chase.add_argument("--delay", type=float, default=0.05)
-    p_chase.add_argument("--loops", type=_parse_inf_int, default=None, help="Loop count (use 'inf' for infinite)")
+    p_chase.add_argument("--loops", type=_parse_inf_int, default="inf", help="Loop count (use 'inf' for infinite)")
     p_chase.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
     p_chase.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
     p_chase.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_chase.set_defaults(func=cmd_chase)
 
     args = p.parse_args(argv)
+
+    # Normalize "inf" defaults (argparse does not type-convert defaults)
+    for attr, conv in (
+        ("hold_s", _parse_inf_float),
+        ("blink_cycles", _parse_inf_int),
+        ("loops", _parse_inf_int),
+    ):
+        if hasattr(args, attr):
+            v = getattr(args, attr)
+            if isinstance(v, str):
+                setattr(args, attr, conv(v))
 
     # Normalize light --led synonym and defaults
     if getattr(args, "cmd", None) == "light":
