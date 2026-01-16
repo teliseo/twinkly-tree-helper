@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v5)
+"""Twinkly Tree Helper (v6)
 
 Objective
 ---------
@@ -29,6 +29,12 @@ v4 changes
 v5 changes
 ----------
 - Help defaults now display meaningful values (e.g. params file name, and "inf" instead of None).
+
+v6 changes
+----------
+- Add help text for previously-undocumented options so defaults display consistently.
+- User-facing color defaults are now shown as hex strings (e.g. "#ff0000").
+- Decimal color parsing now accepts R,G,B,W for RGBW strings.
 
 String naming and segmentation
 ------------------------------
@@ -75,7 +81,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 5
+VERSION = 6
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -318,15 +324,20 @@ def _parse_color(s: str) -> Color:
         return (_clamp_u8(r), _clamp_u8(g), _clamp_u8(b), _clamp_u8(w))
 
     parts = [p.strip() for p in s.split(",") if p.strip() != ""]
-    if len(parts) != 3:
-        raise argparse.ArgumentTypeError("Color must be R,G,B or #RRGGBB (or #RRGGBBWW)")
+    if len(parts) not in (3, 4):
+        raise argparse.ArgumentTypeError(
+            "Color must be R,G,B or R,G,B,W or #RRGGBB (or #RRGGBBWW)"
+        )
     try:
-        r, g, b = (int(parts[0]), int(parts[1]), int(parts[2]))
+        nums = [int(p) for p in parts]
     except ValueError as e:
         raise argparse.ArgumentTypeError("RGB values must be integers") from e
-    if any(v < 0 or v > 255 for v in (r, g, b)):
-        raise argparse.ArgumentTypeError("RGB values must be 0..255")
-    return (r, g, b, 0)
+    if any(v < 0 or v > 255 for v in nums):
+        raise argparse.ArgumentTypeError("RGB/W values must be 0..255")
+
+    r, g, b = nums[0], nums[1], nums[2]
+    w = nums[3] if len(nums) == 4 else 0
+    return (_clamp_u8(r), _clamp_u8(g), _clamp_u8(b), _clamp_u8(w))
 
 
 def _resolve_index(idx: int, nleds: int) -> int:
@@ -794,8 +805,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Discover Twinkly devices on LAN",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p_disc.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="HTTP timeout")
-    p_disc.add_argument("--discovery-timeout", type=float, default=0.9, help="UDP discovery timeout")
+    p_disc.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
+    p_disc.add_argument(
+        "--discovery-timeout",
+        type=float,
+        default=0.9,
+        help="UDP discovery listen timeout (seconds)",
+    )
     p_disc.add_argument(
         "--write-params",
         action="store_true",
@@ -820,7 +841,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_target_args(p_info)
-    p_info.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    p_info.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
     p_info.set_defaults(func=cmd_info)
 
     p_strings = sub.add_parser(
@@ -828,7 +854,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="List known string names from params file",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p_strings.add_argument("--params", help="Params file path", default=DEFAULT_PARAMS_FILENAME)
+    p_strings.add_argument(
+        "--params",
+        help="Params file path",
+        default=DEFAULT_PARAMS_FILENAME,
+    )
     p_strings.add_argument("--details", action="store_true", help="Show per-string details")
     p_strings.add_argument("--json", action="store_true", help="Emit JSON (full params contents)")
     p_strings.set_defaults(func=cmd_strings)
@@ -846,10 +876,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_light.add_argument("--start", type=int, default=None, help="Start index within string (allow negative)")
     p_light.add_argument("--led", type=int, default=None, help="Synonym for --start")
     p_light.add_argument("--end", type=int, default=None, help="End index within string (allow negative)")
-    p_light.add_argument("--step", type=int, default=1)
-    p_light.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
+    p_light.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Step for the range (direction auto-adjusts if needed)",
+    )
+    p_light.add_argument(
+        "--rgb",
+        type=_parse_color,
+        default="#ff0000",
+        help="Primary color: R,G,B or R,G,B,W or #RRGGBB (or #RRGGBBWW)",
+    )
     p_light.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
-    p_light.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    p_light.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
     p_light.add_argument("--hold-s", type=_parse_inf_float, default="inf", help="Hold time after setting (use 'inf' to hold forever)")
     p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
     p_light.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
@@ -861,10 +906,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_target_args(p_end)
-    p_end.add_argument("--last-n", type=int, default=1)
-    p_end.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
-    p_end.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p_end.add_argument("--blink-hz", type=float, default=2.0)
+    p_end.add_argument(
+        "--last-n",
+        type=int,
+        default=1,
+        help="How many LEDs at the end of the string to blink",
+    )
+    p_end.add_argument(
+        "--rgb",
+        type=_parse_color,
+        default="#ff0000",
+        help="Color: R,G,B or R,G,B,W or #RRGGBB (or #RRGGBBWW)",
+    )
+    p_end.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
+    p_end.add_argument(
+        "--blink-hz",
+        type=float,
+        default=2.0,
+        help="Blink frequency in Hz",
+    )
     p_end.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
     p_end.set_defaults(func=cmd_find_end)
 
@@ -876,15 +941,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     _add_target_args(p_chase)
     p_chase.add_argument("--start", type=int, default=0, help="Start index within string (allow negative)")
     p_chase.add_argument("--end", type=int, default=-1, help="End index within string (allow negative)")
-    p_chase.add_argument("--step", type=int, default=1)
-    p_chase.add_argument("--delay", type=float, default=0.05)
+    p_chase.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Step for the chase path (direction auto-adjusts if needed)",
+    )
+    p_chase.add_argument(
+        "--delay",
+        type=float,
+        default=0.05,
+        help="Delay between frames (seconds)",
+    )
     p_chase.add_argument("--loops", type=_parse_inf_int, default="inf", help="Loop count (use 'inf' for infinite)")
-    p_chase.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
+    p_chase.add_argument(
+        "--rgb",
+        type=_parse_color,
+        default="#ff0000",
+        help="Primary color: R,G,B or R,G,B,W or #RRGGBB (or #RRGGBBWW)",
+    )
     p_chase.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
-    p_chase.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
+    p_chase.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
     p_chase.set_defaults(func=cmd_chase)
 
     args = p.parse_args(argv)
+
+    # Normalize defaults that are strings (argparse does not type-convert defaults)
+    for attr, conv in (
+        ("hold_s", _parse_inf_float),
+        ("blink_cycles", _parse_inf_int),
+        ("loops", _parse_inf_int),
+        ("rgb", _parse_color),
+        ("rgb2", _parse_color),
+    ):
+        if hasattr(args, attr):
+            v = getattr(args, attr)
+            if isinstance(v, str):
+                setattr(args, attr, conv(v))
 
     # Normalize "inf" defaults (argparse does not type-convert defaults)
     for attr, conv in (
