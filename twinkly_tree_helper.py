@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v2)
+"""Twinkly Tree Helper (v2a)
 
 Objective
 ---------
@@ -69,7 +69,7 @@ VERSION = 2
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
-DISCOVERY_PAYLOAD = b"discover"
+DISCOVERY_PAYLOAD = b"\x01discover"
 
 DEFAULT_PARAMS_FILENAME = "twinkly_strings.json"
 DEFAULT_SEGMENT_LEN = 300
@@ -341,8 +341,7 @@ def _load_params(path: Path) -> Dict[str, dict]:
 
 
 def _save_params(path: Path, data: Dict[str, dict]) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "
-", "utf-8")
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", "utf-8")
 
 
 def _suffix_letters(n: int) -> List[str]:
@@ -447,8 +446,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     if args.write_params:
         path = _params_path(args.params_out)
         _save_params(path, params_out)
-        print(f"
-Wrote {len(params_out)} string entries to: {path}")
+        print(f"\nWrote {len(params_out)} string entries to: {path}")
 
     return 0
 
