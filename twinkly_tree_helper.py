@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v2a)
+"""Twinkly Tree Helper (v3)
 
 Objective
 ---------
@@ -13,6 +13,10 @@ v2 changes
 - `discover` can write a current-directory parameter file that defines named
   *strings* (segments) derived from each device's `device_name`.
 - Other commands can target a string via `--string NAME` instead of `--ip`.
+
+v3 changes
+----------
+- Add `strings` command to list known string names from the params file.
 
 String naming and segmentation
 ------------------------------
@@ -65,7 +69,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-VERSION = 2
+VERSION = 3
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -464,11 +468,45 @@ def cmd_info(args: argparse.Namespace) -> int:
 
     out = {
         "version": VERSION,
-        "target": {"ip": ip, "start": start, "length": length, "string": getattr(args, "string", None)},
+        "target": {
+            "ip": ip,
+            "start": start,
+            "length": length,
+            "string": getattr(args, "string", None),
+        },
         "mode": mode,
         "gestalt": g,
     }
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_strings(args: argparse.Namespace) -> int:
+    """List known string names from the params file."""
+    params_path = _params_path(getattr(args, "params", None))
+    params = _load_params(params_path)
+
+    keys = sorted(params.keys())
+    if args.json:
+        print(json.dumps({k: params[k] for k in keys}, indent=2, sort_keys=True))
+        return 0
+
+    if not keys:
+        print(f"No strings found in {params_path}")
+        return 1
+
+    if args.details:
+        for k in keys:
+            ent = params[k]
+            ip = ent.get("ip")
+            start = ent.get("start")
+            length = ent.get("length")
+            device_name = ent.get("device_name")
+            print(f"{k}	ip={ip}	start={start}	length={length}	device_name={device_name}")
+    else:
+        for k in keys:
+            print(k)
+
     return 0
 
 
@@ -621,6 +659,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     _add_target_args(p_info)
     p_info.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_info.set_defaults(func=cmd_info)
+
+    p_strings = sub.add_parser("strings", help="List known string names from params file")
+    p_strings.add_argument(
+        "--params",
+        help=f"Params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
+        default=None,
+    )
+    p_strings.add_argument("--details", action="store_true", help="Show per-string details")
+    p_strings.add_argument("--json", action="store_true", help="Emit JSON (full params contents)")
+    p_strings.set_defaults(func=cmd_strings)
 
     p_light = sub.add_parser("light", help="Light a LED index (0-based within string; allow -1 for last)")
     _add_target_args(p_light)
