@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v6)
+"""Twinkly Tree Helper (v7)
 
 Objective
 ---------
@@ -35,6 +35,10 @@ v6 changes
 - Add help text for previously-undocumented options so defaults display consistently.
 - User-facing color defaults are now shown as hex strings (e.g. "#ff0000").
 - Decimal color parsing now accepts R,G,B,W for RGBW strings.
+
+v7 changes
+----------
+- Keepalive refresh: when holding a static frame (e.g. light --hold-s inf), periodically resend the frame so the device does not revert to its built-in effect.
 
 String naming and segmentation
 ------------------------------
@@ -81,7 +85,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 6
+VERSION = 7
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -497,6 +501,21 @@ def _sleep_forever() -> None:
         time.sleep(3600)
 
 
+def _hold_with_keepalive(client: TwinklyClient, frame_on: bytes, keepalive_s: float) -> None:
+    """Hold a frame indefinitely by periodically resending it.
+
+    Many Twinkly devices treat realtime (rt) as a stream; if frames stop arriving,
+    they revert to their previous (built-in) effect after a short timeout.
+    """
+    # Keepalive too small can spam the device; too large can allow timeout.
+    ka = float(keepalive_s)
+    if ka <= 0:
+        ka = 0.8
+    while True:
+        client.rt_frame(frame_on)
+        time.sleep(ka)
+
+
 def cmd_discover(args: argparse.Namespace) -> int:
     ips = discover(timeout_s=float(args.discovery_timeout))
     if not ips:
@@ -689,12 +708,13 @@ def cmd_light(args: argparse.Namespace) -> int:
         idxs_and_colors.append((idx, c_here))
 
     with _with_rt_mode(c):
-        c.rt_frame(build_frame(nleds, bpl, idxs_and_colors))
+        frame_on = build_frame(nleds, bpl, idxs_and_colors)
+        c.rt_frame(frame_on)
 
         # Hold
         hold_s = args.hold_s
         if hold_s is None:
-            _sleep_forever()
+            _hold_with_keepalive(c, frame_on, float(args.keepalive_s))
         elif float(hold_s) > 0:
             time.sleep(float(hold_s))
 
@@ -895,7 +915,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=DEFAULT_TIMEOUT_S,
         help="HTTP request timeout (seconds)",
     )
-    p_light.add_argument("--hold-s", type=_parse_inf_float, default="inf", help="Hold time after setting (use 'inf' to hold forever)")
+    p_light.add_argument(
+        "--hold-s",
+        type=_parse_inf_float,
+        default="inf",
+        help="Hold time after setting (seconds). Use 'inf' to hold forever.",
+    )
+    p_light.add_argument(
+        "--keepalive-s",
+        type=float,
+        default=0.8,
+        help="When holding forever, resend the same frame every N seconds to prevent the device reverting",
+    )
     p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
     p_light.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
     p_light.set_defaults(func=cmd_light)
@@ -978,17 +1009,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("loops", _parse_inf_int),
         ("rgb", _parse_color),
         ("rgb2", _parse_color),
-    ):
-        if hasattr(args, attr):
-            v = getattr(args, attr)
-            if isinstance(v, str):
-                setattr(args, attr, conv(v))
-
-    # Normalize "inf" defaults (argparse does not type-convert defaults)
-    for attr, conv in (
-        ("hold_s", _parse_inf_float),
-        ("blink_cycles", _parse_inf_int),
-        ("loops", _parse_inf_int),
     ):
         if hasattr(args, attr):
             v = getattr(args, attr)
