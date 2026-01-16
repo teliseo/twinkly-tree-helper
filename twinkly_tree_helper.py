@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v8)
+"""Twinkly Tree Helper (v9)
 
 Objective
 ---------
@@ -44,6 +44,11 @@ v8 changes
 ----------
 - Make auth failures visible (info now reports the auth error instead of a vague placeholder).
 - Add `login` command to explicitly authenticate and (re)write the cached token file.
+
+v9 changes
+----------
+- RT keepalive is now "mode-aware": while holding, periodically re-assert mode=rt and re-send the frame, because some firmwares revert to movie even if HTTP /led/rt/frame is posted.
+- Fix RGBW frame byte order to W,R,G,B as documented.
 
 String naming and segmentation
 ------------------------------
@@ -90,7 +95,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 8
+VERSION = 9
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -376,7 +381,12 @@ def build_frame(
     bytes_per_led: int,
     indices_and_colors: Sequence[Tuple[int, Color]],
 ) -> bytes:
-    """Build a single-frame payload with the given indices set to specific colors."""
+    """Build a single-frame payload with the given indices set to specific colors.
+
+    Note on byte order:
+    - RGB profile (bytes_per_led=3): R,G,B
+    - RGBW profile (bytes_per_led=4): W,R,G,B (per xled-docs)
+    """
     if bytes_per_led not in (3, 4):
         raise ValueError(f"Unsupported bytes_per_led={bytes_per_led}; expected 3 or 4")
 
@@ -386,11 +396,18 @@ def build_frame(
         if idx < 0 or idx >= nleds:
             continue
         base = idx * bytes_per_led
-        out[base + 0] = c[0]
-        out[base + 1] = c[1]
-        out[base + 2] = c[2]
-        if bytes_per_led == 4:
-            out[base + 3] = c[3]
+        if bytes_per_led == 3:
+            out[base + 0] = c[0]
+            out[base + 1] = c[1]
+            out[base + 2] = c[2]
+        else:
+            # RGBW is W,R,G,B
+            out[base + 0] = c[3]
+            out[base + 1] = c[0]
+            out[base + 2] = c[1]
+            out[base + 3] = c[2]
+
+    return bytes(out)
 
     return bytes(out)
 
@@ -506,17 +523,43 @@ def _sleep_forever() -> None:
         time.sleep(3600)
 
 
-def _hold_with_keepalive(client: TwinklyClient, frame_on: bytes, keepalive_s: float) -> None:
+def _hold_with_keepalive(
+    client: TwinklyClient,
+    frame_on: bytes,
+    keepalive_s: float,
+    assert_rt_every_s: float,
+) -> None:
     """Hold a frame indefinitely by periodically resending it.
 
-    Many Twinkly devices treat realtime (rt) as a stream; if frames stop arriving,
-    they revert to their previous (built-in) effect after a short timeout.
+    Some Twinkly firmwares revert from mode=rt back to movie after a short time
+    even if HTTP /led/rt/frame is used. (The original protocol uses UDP frames.)
+
+    To be robust, we periodically:
+      - ensure mode=rt
+      - re-send the same frame
     """
-    # Keepalive too small can spam the device; too large can allow timeout.
     ka = float(keepalive_s)
     if ka <= 0:
         ka = 0.8
+
+    assert_every = float(assert_rt_every_s)
+    if assert_every <= 0:
+        assert_every = 3.0
+
+    t_last_assert = 0.0
+
     while True:
+        now = time.time()
+        if (now - t_last_assert) >= assert_every:
+            try:
+                # Cheap "belt and suspenders" — reassert rt periodically.
+                client.set_mode("rt")
+            except Exception:
+                # If auth expired or mode query fails, rt_frame below will still
+                # attempt to re-auth via _auth_headers().
+                pass
+            t_last_assert = now
+
         client.rt_frame(frame_on)
         time.sleep(ka)
 
@@ -744,7 +787,7 @@ def cmd_light(args: argparse.Namespace) -> int:
         # Hold
         hold_s = args.hold_s
         if hold_s is None:
-            _hold_with_keepalive(c, frame_on, float(args.keepalive_s))
+            _hold_with_keepalive(c, frame_on, float(args.keepalive_s), float(args.assert_rt_every_s))
         elif float(hold_s) > 0:
             time.sleep(float(hold_s))
 
@@ -969,7 +1012,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--keepalive-s",
         type=float,
         default=0.8,
-        help="When holding forever, resend the same frame every N seconds to prevent the device reverting",
+        help="When holding forever, resend the same frame every N seconds to reduce reversion",
+    )
+    p_light.add_argument(
+        "--assert-rt-every-s",
+        type=float,
+        default=3.0,
+        help="While holding, re-send mode=rt every N seconds (helps on firmwares that revert despite keepalive)",
     )
     p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
     p_light.add_argument("--blink-cycles", type=_parse_inf_int, default="inf", help="Blink cycle count (use 'inf' for infinite)")
