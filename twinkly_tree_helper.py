@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v7)
+"""Twinkly Tree Helper (v8)
 
 Objective
 ---------
@@ -39,6 +39,11 @@ v6 changes
 v7 changes
 ----------
 - Keepalive refresh: when holding a static frame (e.g. light --hold-s inf), periodically resend the frame so the device does not revert to its built-in effect.
+
+v8 changes
+----------
+- Make auth failures visible (info now reports the auth error instead of a vague placeholder).
+- Add `login` command to explicitly authenticate and (re)write the cached token file.
 
 String naming and segmentation
 ------------------------------
@@ -85,7 +90,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 7
+VERSION = 8
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -575,10 +580,12 @@ def cmd_info(args: argparse.Namespace) -> int:
     c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
 
+    mode_error = None
     try:
         mode = c.get_mode()
-    except Exception:
-        mode = "(auth required / unavailable)"
+    except Exception as e:
+        mode = None
+        mode_error = str(e)
 
     out = {
         "version": VERSION,
@@ -589,7 +596,30 @@ def cmd_info(args: argparse.Namespace) -> int:
             "string": getattr(args, "string", None),
         },
         "mode": mode,
+        "mode_error": mode_error,
         "gestalt": g,
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Explicitly authenticate and write a fresh token to the cache."""
+    ip, _start, _length = _string_target_from_args(args)
+    c = TwinklyClient(ip, timeout_s=args.timeout)
+
+    # Force a login; Twinkly issues a new token and invalidates any previous one.
+    c.login()
+
+    # Re-load from disk to show what's now cached.
+    ti = c._load_cached_token()
+    out = {
+        "version": VERSION,
+        "ip": ip,
+        "token_cache_path": str(c._token_path()),
+        "cached": bool(ti),
+        "expires_at_unix": ti.expires_at_unix if ti else None,
+        "seconds_remaining": (ti.expires_at_unix - time.time()) if ti else None,
     }
     print(json.dumps(out, indent=2))
     return 0
@@ -868,6 +898,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="HTTP request timeout (seconds)",
     )
     p_info.set_defaults(func=cmd_info)
+
+    p_login = sub.add_parser(
+        "login",
+        help="Authenticate to the device and (re)write the cached token file",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_target_args(p_login)
+    p_login.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        help="HTTP request timeout (seconds)",
+    )
+    p_login.set_defaults(func=cmd_login)
 
     p_strings = sub.add_parser(
         "strings",
