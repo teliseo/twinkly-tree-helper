@@ -1,5 +1,5 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v3)
+"""Twinkly Tree Helper (v4)
 
 Objective
 ---------
@@ -17,6 +17,14 @@ v2 changes
 v3 changes
 ----------
 - Add `strings` command to list known string names from the params file.
+
+v4 changes
+----------
+- Help now shows default values (ArgumentDefaultsHelpFormatter).
+- Duration/count parameters default to infinite (support special value "inf").
+- RGB parsing supports "R,G,B" as well as "#RRGGBB" (and "#RRGGBBWW").
+- `light` can light a *range* (like `chase`) and supports --rgb2 for interpolation.
+- `chase` supports --rgb2 for interpolation.
 
 String naming and segmentation
 ------------------------------
@@ -36,12 +44,6 @@ Parameter file format
 ---------------------
 JSON file in the current working directory.
 Default name: ./twinkly_strings.json
-
-Example entry:
-  {
-    "MyTreea": {"ip":"192.168.1.10","start":0,"length":300,"device_name":"MyTree",...},
-    "MyTreeb": {"ip":"192.168.1.10","start":300,"length":300,"device_name":"MyTree",...}
-  }
 
 Notes / assumptions
 -------------------
@@ -66,10 +68,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = 3
+VERSION = 4
 DEFAULT_TIMEOUT_S = 3.0
 
 DISCOVERY_PORT = 5555
@@ -77,6 +79,9 @@ DISCOVERY_PAYLOAD = b"\x01discover"
 
 DEFAULT_PARAMS_FILENAME = "twinkly_strings.json"
 DEFAULT_SEGMENT_LEN = 300
+
+
+Color = Tuple[int, int, int, int]  # (r,g,b,w)
 
 
 def _http_json(
@@ -284,14 +289,40 @@ class TwinklyClient:
         )
 
 
-def _parse_rgb(s: str) -> Tuple[int, int, int]:
-    parts = s.split(",")
+def _clamp_u8(x: int) -> int:
+    if x < 0:
+        return 0
+    if x > 255:
+        return 255
+    return x
+
+
+def _parse_color(s: str) -> Color:
+    s = s.strip()
+
+    if s.startswith("#"):
+        h = s[1:]
+        if len(h) not in (6, 8):
+            raise argparse.ArgumentTypeError("Hex color must be #RRGGBB or #RRGGBBWW")
+        try:
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+            w = int(h[6:8], 16) if len(h) == 8 else 0
+        except ValueError as e:
+            raise argparse.ArgumentTypeError("Invalid hex color") from e
+        return (_clamp_u8(r), _clamp_u8(g), _clamp_u8(b), _clamp_u8(w))
+
+    parts = [p.strip() for p in s.split(",") if p.strip() != ""]
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError("RGB must look like 255,0,0")
-    vals = tuple(int(p.strip()) for p in parts)
-    if any(v < 0 or v > 255 for v in vals):
+        raise argparse.ArgumentTypeError("Color must be R,G,B or #RRGGBB (or #RRGGBBWW)")
+    try:
+        r, g, b = (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("RGB values must be integers") from e
+    if any(v < 0 or v > 255 for v in (r, g, b)):
         raise argparse.ArgumentTypeError("RGB values must be 0..255")
-    return vals  # type: ignore[return-value]
+    return (r, g, b, 0)
 
 
 def _resolve_index(idx: int, nleds: int) -> int:
@@ -303,28 +334,39 @@ def _resolve_index(idx: int, nleds: int) -> int:
     return idx
 
 
-def build_frame_single(
+def _lerp(a: int, b: int, t: float) -> int:
+    return _clamp_u8(int(round(a + (b - a) * t)))
+
+
+def _lerp_color(c1: Color, c2: Color, t: float) -> Color:
+    return (
+        _lerp(c1[0], c2[0], t),
+        _lerp(c1[1], c2[1], t),
+        _lerp(c1[2], c2[2], t),
+        _lerp(c1[3], c2[3], t),
+    )
+
+
+def build_frame(
     nleds: int,
     bytes_per_led: int,
-    lit_indices: Iterable[int],
-    rgb: Tuple[int, int, int],
+    indices_and_colors: Sequence[Tuple[int, Color]],
 ) -> bytes:
-    """Build a single-frame payload with only selected indices lit."""
+    """Build a single-frame payload with the given indices set to specific colors."""
     if bytes_per_led not in (3, 4):
         raise ValueError(f"Unsupported bytes_per_led={bytes_per_led}; expected 3 or 4")
 
-    r, g, b = rgb
-    lit = set(lit_indices)
     out = bytearray(nleds * bytes_per_led)
 
-    for i in range(nleds):
-        if i in lit:
-            base = i * bytes_per_led
-            out[base + 0] = r
-            out[base + 1] = g
-            out[base + 2] = b
-            if bytes_per_led == 4:
-                out[base + 3] = 0  # white channel off
+    for idx, c in indices_and_colors:
+        if idx < 0 or idx >= nleds:
+            continue
+        base = idx * bytes_per_led
+        out[base + 0] = c[0]
+        out[base + 1] = c[1]
+        out[base + 2] = c[2]
+        if bytes_per_led == 4:
+            out[base + 3] = c[3]
 
     return bytes(out)
 
@@ -397,9 +439,47 @@ def _add_target_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--string", help="Named string from params file (see discover --write-params)")
     ap.add_argument(
         "--params",
-        help=f"Params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
+        help="Params file path",
         default=None,
     )
+
+
+def _parse_inf_int(s: str) -> Optional[int]:
+    s = str(s).strip().lower()
+    if s in ("inf", "infinite", "infinity"):
+        return None
+    try:
+        v = int(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("Expected an integer or 'inf'") from e
+    return v
+
+
+def _parse_inf_float(s: str) -> Optional[float]:
+    s = str(s).strip().lower()
+    if s in ("inf", "infinite", "infinity"):
+        return None
+    try:
+        v = float(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("Expected a number or 'inf'") from e
+    return v
+
+
+def _iter_range(start_rel: int, end_rel: int, step: int) -> List[int]:
+    if step == 0:
+        raise ValueError("step cannot be 0")
+    # Auto-adjust direction for user convenience
+    if start_rel > end_rel and step > 0:
+        step = -step
+    if start_rel < end_rel and step < 0:
+        step = -step
+    return list(range(start_rel, end_rel + (1 if step > 0 else -1), step))
+
+
+def _sleep_forever() -> None:
+    while True:
+        time.sleep(3600)
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
@@ -534,41 +614,94 @@ def _with_rt_mode(c: TwinklyClient):
     return _Ctx()
 
 
+def _resolve_segment_indices(
+    args: argparse.Namespace,
+    seg_n: int,
+) -> Tuple[int, int, int, bool]:
+    """Return (start_rel, end_rel, step, used_explicit_start).
+
+    - If user provides --start/--led, default --end to start.
+    - If user provides neither, default start=0, end=-1.
+    """
+    used_explicit_start = args.start is not None
+    start_val = args.start
+
+    if not used_explicit_start:
+        start_rel = 0
+        end_rel = _resolve_index(-1, seg_n)
+    else:
+        start_rel = _resolve_index(int(start_val), seg_n)
+        if args.end is None:
+            end_rel = start_rel
+        else:
+            end_rel = _resolve_index(int(args.end), seg_n)
+
+    step = int(args.step)
+    return (start_rel, end_rel, step, used_explicit_start)
+
+
 def cmd_light(args: argparse.Namespace) -> int:
-    ip, start, seg_len = _string_target_from_args(args)
+    ip, start_off, seg_len = _string_target_from_args(args)
 
     c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
     nleds = int(g["number_of_led"])
     bpl = int(g.get("bytes_per_led", 3))
 
-    # Resolve LED index within segment -> device-wide index
     seg_n = seg_len if seg_len > 0 else nleds
-    rel = _resolve_index(int(args.led), seg_n)
-    idx = start + rel
-    if idx < 0 or idx >= nleds:
-        raise ValueError(f"Resolved LED index out of device range: {idx} (nleds={nleds})")
 
-    rgb = args.rgb
+    # Determine range within segment
+    start_rel, end_rel, step, _used_explicit_start = _resolve_segment_indices(args, seg_n)
+    rel_path = _iter_range(start_rel, end_rel, step)
+
+    rgb1 = args.rgb
+    rgb2 = args.rgb2
+
+    idxs_and_colors: List[Tuple[int, Color]] = []
+    if not rel_path:
+        return 0
+
+    denom = max(1, len(rel_path) - 1)
+    for i, r in enumerate(rel_path):
+        idx = start_off + r
+        if idx < 0 or idx >= nleds:
+            continue
+        if rgb2 is None:
+            c_here = rgb1
+        else:
+            t = i / denom
+            c_here = _lerp_color(rgb1, rgb2, t)
+        idxs_and_colors.append((idx, c_here))
 
     with _with_rt_mode(c):
+        c.rt_frame(build_frame(nleds, bpl, idxs_and_colors))
+
+        # Hold
+        hold_s = args.hold_s
+        if hold_s is None:
+            _sleep_forever()
+        elif float(hold_s) > 0:
+            time.sleep(float(hold_s))
+
+        # Optional blink
         if args.blink_hz:
             period = 1.0 / float(args.blink_hz)
-            for _ in range(args.blink_cycles):
-                c.rt_frame(build_frame_single(nleds, bpl, [idx], rgb))
+            cycles = args.blink_cycles
+            while True:
+                c.rt_frame(build_frame(nleds, bpl, idxs_and_colors))
                 time.sleep(period / 2)
-                c.rt_frame(build_frame_single(nleds, bpl, [], rgb))
+                c.rt_frame(build_frame(nleds, bpl, []))
                 time.sleep(period / 2)
-        else:
-            c.rt_frame(build_frame_single(nleds, bpl, [idx], rgb))
-            if args.hold_s > 0:
-                time.sleep(args.hold_s)
+                if cycles is not None:
+                    cycles -= 1
+                    if cycles <= 0:
+                        break
 
     return 0
 
 
 def cmd_find_end(args: argparse.Namespace) -> int:
-    ip, start, seg_len = _string_target_from_args(args)
+    ip, start_off, seg_len = _string_target_from_args(args)
 
     c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
@@ -578,23 +711,30 @@ def cmd_find_end(args: argparse.Namespace) -> int:
     seg_n = seg_len if seg_len > 0 else nleds
 
     count = max(1, int(args.last_n))
-    # last N within the segment
     rel_idxs = list(range(seg_n - count, seg_n))
-    idxs = [start + r for r in rel_idxs]
+    idxs = [start_off + r for r in rel_idxs]
+
+    on_frame = build_frame(nleds, bpl, [(i, args.rgb) for i in idxs])
+    off_frame = build_frame(nleds, bpl, [])
 
     with _with_rt_mode(c):
         period = 1.0 / float(args.blink_hz)
-        for _ in range(args.blink_cycles):
-            c.rt_frame(build_frame_single(nleds, bpl, idxs, args.rgb))
+        cycles = args.blink_cycles
+        while True:
+            c.rt_frame(on_frame)
             time.sleep(period / 2)
-            c.rt_frame(build_frame_single(nleds, bpl, [], args.rgb))
+            c.rt_frame(off_frame)
             time.sleep(period / 2)
+            if cycles is not None:
+                cycles -= 1
+                if cycles <= 0:
+                    break
 
     return 0
 
 
 def cmd_chase(args: argparse.Namespace) -> int:
-    ip, start, seg_len = _string_target_from_args(args)
+    ip, start_off, seg_len = _string_target_from_args(args)
 
     c = TwinklyClient(ip, timeout_s=args.timeout)
     g = c.gestalt()
@@ -605,42 +745,57 @@ def cmd_chase(args: argparse.Namespace) -> int:
 
     start_rel = _resolve_index(int(args.start), seg_n)
     end_rel = _resolve_index(int(args.end), seg_n)
-
-    step = int(args.step)
-    if step == 0:
-        raise ValueError("step cannot be 0")
-
-    # Auto-adjust direction for user convenience
-    if start_rel > end_rel and step > 0:
-        step = -step
-    if start_rel < end_rel and step < 0:
-        step = -step
-
-    path_rel = list(range(start_rel, end_rel + (1 if step > 0 else -1), step))
-    if not path_rel:
+    rel_path = _iter_range(start_rel, end_rel, int(args.step))
+    if not rel_path:
         return 0
 
+    rgb1 = args.rgb
+    rgb2 = args.rgb2
+
+    loops = args.loops
+
     with _with_rt_mode(c):
-        for _ in range(max(1, int(args.loops))):
-            for r in path_rel:
-                idx = start + r
-                c.rt_frame(build_frame_single(nleds, bpl, [idx], args.rgb))
+        loop_idx = 0
+        while True:
+            denom = max(1, len(rel_path) - 1)
+            for i, r in enumerate(rel_path):
+                idx = start_off + r
+                if idx < 0 or idx >= nleds:
+                    continue
+                if rgb2 is None:
+                    c_here = rgb1
+                else:
+                    t = i / denom
+                    c_here = _lerp_color(rgb1, rgb2, t)
+
+                c.rt_frame(build_frame(nleds, bpl, [(idx, c_here)]))
                 time.sleep(float(args.delay))
+
+            loop_idx += 1
+            if loops is not None and loop_idx >= loops:
+                break
 
     return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description=f"Twinkly Tree Helper (v{VERSION})")
+    p = argparse.ArgumentParser(
+        description=f"Twinkly Tree Helper (v{VERSION})",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_disc = sub.add_parser("discover", help="Discover Twinkly devices on LAN")
+    p_disc = sub.add_parser(
+        "discover",
+        help="Discover Twinkly devices on LAN",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p_disc.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="HTTP timeout")
     p_disc.add_argument("--discovery-timeout", type=float, default=0.9, help="UDP discovery timeout")
     p_disc.add_argument(
         "--write-params",
         action="store_true",
-        help=f"Write named strings to ./{DEFAULT_PARAMS_FILENAME} (or --params-out)",
+        help="Write named strings to params file",
     )
     p_disc.add_argument(
         "--params-out",
@@ -651,56 +806,88 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--segment-len",
         type=int,
         default=DEFAULT_SEGMENT_LEN,
-        help=f"Segment length used when device LED count is divisible by it (default: {DEFAULT_SEGMENT_LEN})",
+        help="Segment length used when device LED count is divisible by it",
     )
     p_disc.set_defaults(func=cmd_discover)
 
-    p_info = sub.add_parser("info", help="Print device gestalt + current mode")
+    p_info = sub.add_parser(
+        "info",
+        help="Print device gestalt + current mode",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     _add_target_args(p_info)
     p_info.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_info.set_defaults(func=cmd_info)
 
-    p_strings = sub.add_parser("strings", help="List known string names from params file")
-    p_strings.add_argument(
-        "--params",
-        help=f"Params file path (default: ./{DEFAULT_PARAMS_FILENAME})",
-        default=None,
+    p_strings = sub.add_parser(
+        "strings",
+        help="List known string names from params file",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p_strings.add_argument("--params", help="Params file path", default=None)
     p_strings.add_argument("--details", action="store_true", help="Show per-string details")
     p_strings.add_argument("--json", action="store_true", help="Emit JSON (full params contents)")
     p_strings.set_defaults(func=cmd_strings)
 
-    p_light = sub.add_parser("light", help="Light a LED index (0-based within string; allow -1 for last)")
+    p_light = sub.add_parser(
+        "light",
+        help="Light one LED or a range within the target string",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     _add_target_args(p_light)
-    p_light.add_argument("--led", type=int, required=True)
-    p_light.add_argument("--rgb", type=_parse_rgb, default=(255, 0, 0))
+    # Range semantics:
+    # - --led is a synonym for --start
+    # - If start provided, default end=start
+    # - If neither provided, default start=0 end=-1
+    p_light.add_argument("--start", type=int, default=None, help="Start index within string (allow negative)")
+    p_light.add_argument("--led", type=int, default=None, help="Synonym for --start")
+    p_light.add_argument("--end", type=int, default=None, help="End index within string (allow negative)")
+    p_light.add_argument("--step", type=int, default=1)
+    p_light.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
+    p_light.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
     p_light.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    p_light.add_argument("--hold-s", type=float, default=0.0)
-    p_light.add_argument("--blink-hz", type=float, default=0.0)
-    p_light.add_argument("--blink-cycles", type=int, default=10)
+    p_light.add_argument("--hold-s", type=_parse_inf_float, default=None, help="Hold time after setting (use 'inf' to hold forever)")
+    p_light.add_argument("--blink-hz", type=float, default=0.0, help="If >0, blink at this frequency")
+    p_light.add_argument("--blink-cycles", type=_parse_inf_int, default=None, help="Blink cycle count (use 'inf' for infinite)")
     p_light.set_defaults(func=cmd_light)
 
-    p_end = sub.add_parser("find-end", help="Blink the last LED (or last N) within the target string")
+    p_end = sub.add_parser(
+        "find-end",
+        help="Blink the last LED (or last N) within the target string",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     _add_target_args(p_end)
     p_end.add_argument("--last-n", type=int, default=1)
-    p_end.add_argument("--rgb", type=_parse_rgb, default=(255, 0, 0))
+    p_end.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
     p_end.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_end.add_argument("--blink-hz", type=float, default=2.0)
-    p_end.add_argument("--blink-cycles", type=int, default=20)
+    p_end.add_argument("--blink-cycles", type=_parse_inf_int, default=None, help="Blink cycle count (use 'inf' for infinite)")
     p_end.set_defaults(func=cmd_find_end)
 
-    p_chase = sub.add_parser("chase", help="Chase a single lit LED across a range within the target string")
+    p_chase = sub.add_parser(
+        "chase",
+        help="Chase a single lit LED across a range within the target string",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     _add_target_args(p_chase)
     p_chase.add_argument("--start", type=int, default=0, help="Start index within string (allow negative)")
     p_chase.add_argument("--end", type=int, default=-1, help="End index within string (allow negative)")
     p_chase.add_argument("--step", type=int, default=1)
     p_chase.add_argument("--delay", type=float, default=0.05)
-    p_chase.add_argument("--loops", type=int, default=1)
-    p_chase.add_argument("--rgb", type=_parse_rgb, default=(255, 0, 0))
+    p_chase.add_argument("--loops", type=_parse_inf_int, default=None, help="Loop count (use 'inf' for infinite)")
+    p_chase.add_argument("--rgb", type=_parse_color, default=(255, 0, 0, 0))
+    p_chase.add_argument("--rgb2", type=_parse_color, default=None, help="If set, interpolate from --rgb to --rgb2")
     p_chase.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p_chase.set_defaults(func=cmd_chase)
 
     args = p.parse_args(argv)
+
+    # Normalize light --led synonym and defaults
+    if getattr(args, "cmd", None) == "light":
+        if args.led is not None:
+            args.start = args.led
+        # leave args.start as-is (None means "no explicit start")
+
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
