@@ -1,5 +1,10 @@
 #! /bin/python3
-"""Twinkly Tree Helper (v9)
+"""Twinkly Tree Helper (v10)
+
+AI Disclaimer
+----------
+This code and doc was written by ChatGPT 5.2 from my specific direction. I've
+tested and reviewed the functionality, but have reviewed the code very little.
 
 Objective
 ---------
